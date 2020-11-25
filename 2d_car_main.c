@@ -76,7 +76,7 @@ typedef struct Control_Input {
 	// Control_Input_Button_Flags buttons;
 	s16 acceleration_axis;
 	s16 turn_axis;
-} Control_Input;
+} __attribute__((packed)) Control_Input;
 
 typedef struct Sensor_Data {
 	float delta_x;
@@ -98,7 +98,7 @@ struct Application_State {
 	int keys_length;
 
 	UDPsocket udp_socket;
-	s32 udp_channel;
+	IPaddress controller_address;
 	UDPpacket *udp_packet;
 
 	Control_Input car_input;
@@ -298,18 +298,33 @@ DEFINE_CONTROL_FUNCTION(local_ai_input_from_sensor_data) {
 
 DEFINE_CONTROL_FUNCTION(remote_ai_input_from_sensor_data) {
 
+	static Control_Input last_input = (Control_Input){0};
+
+
+	UDPpacket packet = {0};
+	u8 payload[128];
+	*(Sensor_Data *)payload = sensor_data;
+	packet.channel = -1;                             // The src/dst channel of the packet
+	packet.data = payload;                           // The packet data
+	packet.len = sizeof(sensor_data);                // The length of the packet data
+	packet.maxlen = sizeof(payload);                 // The size of the data buffer
+	packet.status = 0;                               // packet status after sending
+	packet.address = app_state->controller_address;  // The source/dest address of an incoming/outgoing packet
+
+	if (0 == SDLNet_UDP_Send(app_state->udp_socket, -1, &packet)) {
+		panic("Error: Could not send sensor data. SDLNet Error: '%s'\n", SDLNet_GetError());
+	}
+
 	Control_Input result = (Control_Input){0};
 
-
-	*(Sensor_Data *)app_state.udp_packet->data = sensor_data;
-	app_state.udp_packet->len = sizeof(sensor_data);
-	if (0 == SDLNet_UDP_Send(app_state.udp_socket, app_state.udp_channel, app_state.udp_packet)) {
-		panic("Error: Could not send udp_packet.\n");
+	if (SDLNet_UDP_Recv(app_state->udp_socket, &packet)) {
+		last_input = result = *(Control_Input *)packet.data;
+	}
+	else {
+		result = last_input;
+		printf("stale input: %d,%d\n", result.acceleration_axis, result.turn_axis);
 	}
 
-	if (SDLNet_UDP_Recv(app_state.udp_socket, app_state.udp_packet)) {
-		app_state.car_input = *(Control_Input *)app_state.udp_packet->data;
-	}
 
 	return result;
 }
@@ -317,10 +332,6 @@ DEFINE_CONTROL_FUNCTION(remote_ai_input_from_sensor_data) {
 
 int main(int argc, char **argv) {
 
-	const char *controller_ip = argc > 1 ? argv[1] : "127.0.0.1";
-	u16 controller_port = argc > 2 ? atoi(argv[2]) : 9001;
-
-	printf("Connecting to controller on socket (%s:%d)\n", controller_ip, controller_port);
 
 	if (SDL_Init(SDL_INIT_VIDEO) != 0) {
 		panic("SDL_Init Error: %s\n", SDL_GetError());
@@ -351,7 +362,7 @@ int main(int argc, char **argv) {
 	Application_State app_state = {0};
 	const u8 *keys = app_state.keys = SDL_GetKeyboardState(&app_state.keys_length);
 
-	app_state.control_function = local_ai_input_from_sensor_data;
+	app_state.control_function = remote_ai_input_from_sensor_data;
 
 	s32 window_width;
 	s32 window_height;
@@ -385,17 +396,15 @@ int main(int argc, char **argv) {
 
 	app_state.cars[1] = *car;
 
-	app_state.udp_socket = SDLNet_UDP_Open(9000);
+	app_state.udp_socket = SDLNet_UDP_Open(0);
 	if (!app_state.udp_socket) {
-		panic("ERROR: Could not open UDP socket on port 9000.\n");
+		panic("ERROR: Could not open UDP socket.\n");
 	}
 
-	IPaddress ip;
-	SDLNet_ResolveHost(&ip, controller_ip, controller_port);
-	app_state.udp_channel = SDLNet_UDP_Bind(app_state.udp_socket, -1, &ip);
-	if (app_state.udp_channel < 0) {
-		panic("ERROR: Could not bind IP.\n");
-	}
+	const char *controller_ip = argc > 1 ? argv[1] : "127.0.0.1";
+	u16 controller_port = argc > 2 ? atoi(argv[2]) : 9001;
+	printf("Connecting to controller on socket (%s:%d)\n", controller_ip, controller_port);
+	SDLNet_ResolveHost(&app_state.controller_address, controller_ip, controller_port);
 
 	app_state.udp_packet = SDLNet_AllocPacket(32);
 
