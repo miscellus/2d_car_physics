@@ -72,15 +72,6 @@ typedef struct Car {
 	SDL_Texture *texture;
 } Car;
 
-typedef enum Control_Input_Button_Flags
-{
-	CAR_INPUT_BUTTON_ACCELERATE = 0x01,
-	CAR_INPUT_BUTTON_REVERSE =    0x02,
-	CAR_INPUT_BUTTON_TURN_LEFT =  0x04,
-	CAR_INPUT_BUTTON_TURN_RIGHT = 0x08,
-	CAR_INPUT_BUTTON_BREAK =      0x10,
-} Control_Input_Button_Flags;
-
 typedef struct Control_Input {
 	// Control_Input_Button_Flags buttons;
 	s16 acceleration_axis;
@@ -93,9 +84,14 @@ typedef struct Sensor_Data {
 	float heading_direction;
 	float velocity;
 	u64 time;
-} Sensor_Data;
+} __attribute__((packed)) Sensor_Data;
 
-typedef struct Application_State {
+typedef struct Application_State Application_State;
+
+#define DEFINE_CONTROL_FUNCTION(name) Control_Input name(Application_State *app_state, Sensor_Data sensor_data)
+typedef DEFINE_CONTROL_FUNCTION(Control_Function);
+
+struct Application_State {
 	Application_Mode mode;
 
 	const u8 *keys;
@@ -106,15 +102,14 @@ typedef struct Application_State {
 	UDPpacket *udp_packet;
 
 	Control_Input car_input;
-
+	Control_Function *control_function;
 
 	b32 human_control;
 
 	Car cars[2];
 
 	float target_radius;
-
-} Application_State;
+};
 
 static Length_Buffer read_entire_file(s8 *path) {
 
@@ -173,15 +168,12 @@ void update_car(Car *car, Control_Input input) {
 	b32 reverse = input.acceleration_axis < 0;
 	b32 breaking = (reverse && car->velocity > 0) || (!reverse && car->velocity < 0);//input.buttons & (CAR_INPUT_BUTTON_BREAK);
 
-	// if (breaking || reverse) {
-
 	if (breaking) {
 		resistance += car->breaking_resistance;
 	}
 	if (reverse) {
 		car->velocity -= 0.45f*car->acceleration;
 	}
-	// }
 
 	resistance += 0.002f*((car->front_wheel_angle < 0) ? -car->front_wheel_angle : car->front_wheel_angle);
 
@@ -221,28 +213,27 @@ Sensor_Data car_get_sensor_data(Car *car) {
 	result.velocity = car->velocity;
 
 	return result;
-
-#if 0
-
-	float absolute_angle_to_target = atan2f(dy, dx);
-
-	result.angle_delta_to_target = absolute_angle_to_target - car->direction;
-	result.distance_to_target = sqrtf(dx*dx + dy*dy);
-	result.velocity = car->velocity;
-
-	float heading_x = cosf(car->direction);
-	float heading_y = sinf(car->direction);
-	float dot = (dx*heading_x + dy*heading_y)/result.distance_to_target;
-
-	result.dot = dot;
-	// float dot2 = result.velocity * result.distance_to_target * cosf(result.angle_delta_to_target);
-
-	// printf("Dot compare: %f - %f = %f\n", dot, dot2, dot - dot2);
-	return result;
-#endif
 }
 
-Control_Input compute_robot_car_input(Sensor_Data car_sensors) {
+DEFINE_CONTROL_FUNCTION(local_human_input_from_sensor_data) {
+	(void) sensor_data;
+
+	Control_Input result = (Control_Input){0};
+
+	const u8 *keys = app_state->keys;
+
+	if (keys[SDL_SCANCODE_UP])    result.acceleration_axis = 0x7fff;
+	if (keys[SDL_SCANCODE_DOWN])  result.acceleration_axis = -0x8000;
+	if (keys[SDL_SCANCODE_LEFT])  result.turn_axis = -0x8000;
+	if (keys[SDL_SCANCODE_RIGHT]) result.turn_axis = 0x7fff;
+
+	return result;
+}
+
+
+DEFINE_CONTROL_FUNCTION(local_ai_input_from_sensor_data) {
+	(void)app_state; // Unused
+
 	static struct {
 		float acceleration_direction; // -1 for backwards or 1 for forwards
 		u32 mode_switch_time;
@@ -251,8 +242,8 @@ Control_Input compute_robot_car_input(Sensor_Data car_sensors) {
 		0
 	};
 
-	float angle_to_target = atan2f(car_sensors.delta_y, car_sensors.delta_x);
-	float angle_delta = angle_to_target - car_sensors.heading_direction;
+	float angle_to_target = atan2f(sensor_data.delta_y, sensor_data.delta_x);
+	float angle_delta = angle_to_target - sensor_data.heading_direction;
 	if (angle_delta > PI) {
 		angle_delta -= TAU;
 	}
@@ -264,14 +255,14 @@ Control_Input compute_robot_car_input(Sensor_Data car_sensors) {
 	assert(abs_angle_delta < (TAU+0.0001f));
 
 
-	float heading_x = cosf(car_sensors.heading_direction);
-	float heading_y = sinf(car_sensors.heading_direction);
-	float distance_to_target = sqrtf(car_sensors.delta_x*car_sensors.delta_x + car_sensors.delta_y*car_sensors.delta_y);
-	float dot = (car_sensors.delta_x*heading_x + car_sensors.delta_y*heading_y) / distance_to_target;
+	float heading_x = cosf(sensor_data.heading_direction);
+	float heading_y = sinf(sensor_data.heading_direction);
+	float distance_to_target = sqrtf(sensor_data.delta_x*sensor_data.delta_x + sensor_data.delta_y*sensor_data.delta_y);
+	float dot = (sensor_data.delta_x*heading_x + sensor_data.delta_y*heading_y) / distance_to_target;
 
 	float acceleration_factor = 1.0f;
-	if (distance_to_target < 200*car_sensors.velocity) {
-		acceleration_factor = distance_to_target/(200*car_sensors.velocity);
+	if (distance_to_target < 200*sensor_data.velocity) {
+		acceleration_factor = distance_to_target/(200*sensor_data.velocity);
 		acceleration_factor *= acceleration_factor * acceleration_factor * 0.5f;
 	}
 
@@ -304,6 +295,24 @@ Control_Input compute_robot_car_input(Sensor_Data car_sensors) {
 	return result;
 }
 
+
+DEFINE_CONTROL_FUNCTION(remote_ai_input_from_sensor_data) {
+
+	Control_Input result = (Control_Input){0};
+
+
+	*(Sensor_Data *)app_state.udp_packet->data = sensor_data;
+	app_state.udp_packet->len = sizeof(sensor_data);
+	if (0 == SDLNet_UDP_Send(app_state.udp_socket, app_state.udp_channel, app_state.udp_packet)) {
+		panic("Error: Could not send udp_packet.\n");
+	}
+
+	if (SDLNet_UDP_Recv(app_state.udp_socket, app_state.udp_packet)) {
+		app_state.car_input = *(Control_Input *)app_state.udp_packet->data;
+	}
+
+	return result;
+}
 
 
 int main(int argc, char **argv) {
@@ -341,6 +350,8 @@ int main(int argc, char **argv) {
 
 	Application_State app_state = {0};
 	const u8 *keys = app_state.keys = SDL_GetKeyboardState(&app_state.keys_length);
+
+	app_state.control_function = local_ai_input_from_sensor_data;
 
 	s32 window_width;
 	s32 window_height;
@@ -417,7 +428,13 @@ int main(int argc, char **argv) {
 					} break;
 
 					case SDLK_t: {
-						app_state.human_control = !app_state.human_control;
+						if ((app_state.human_control = !app_state.human_control)) {
+							app_state.control_function = local_human_input_from_sensor_data;
+						}
+						else {
+							// app_state.control_function = local_ai_input_from_sensor_data;
+							app_state.control_function = remote_ai_input_from_sensor_data;
+						}
 					} break;
 				}
 			}
@@ -430,7 +447,7 @@ int main(int argc, char **argv) {
 		s32 mouse_x, mouse_y;
 		SDL_GetMouseState(&mouse_x, &mouse_y);
 
-#if 0
+#if 1
 		car->target_x = mouse_x;
 		car->target_y = mouse_y;
 #endif
@@ -439,36 +456,13 @@ int main(int argc, char **argv) {
 
 		Sensor_Data car_sensors = car_get_sensor_data(car);
 		car_sensors.time = frame_count;
-		app_state.car_input = compute_robot_car_input(car_sensors);
-
-		if (0) {
-			*(Sensor_Data *)app_state.udp_packet->data = car_sensors;
-			app_state.udp_packet->len = sizeof(car_sensors);
-			if (0 == SDLNet_UDP_Send(app_state.udp_socket, app_state.udp_channel, app_state.udp_packet)) {
-				panic("Error: Could not send udp_packet.\n");
-			}
-
-			if (SDLNet_UDP_Recv(app_state.udp_socket, app_state.udp_packet)) {
-				app_state.car_input = *(Control_Input *)app_state.udp_packet->data;
-			}
-		}
-
-
-		// printf("car_sensors: {%f, %f, %f, %f}\n", car_sensors.angle_delta_to_target / 6.283185307179586f * 360.0f, car_sensors.distance_to_target, car_sensors.velocity, car_sensors.dot);
-
-		Control_Input car_input = (Control_Input){0};
-
-		if (keys[SDL_SCANCODE_UP])    car_input.acceleration_axis = 0x7fff;
-		if (keys[SDL_SCANCODE_DOWN])  car_input.acceleration_axis = -0x8000;
-		if (keys[SDL_SCANCODE_LEFT])  car_input.turn_axis = -0x8000;
-		if (keys[SDL_SCANCODE_RIGHT]) car_input.turn_axis = 0x7fff;
-		if (keys[SDL_SCANCODE_SPACE] && car->velocity > 0) car_input.acceleration_axis = -0x8000;
+		app_state.car_input = app_state.control_function(&app_state, car_sensors);
 
 		//
 		// Update:
 		//
 
-		update_car(car, app_state.human_control ? car_input : app_state.car_input);
+		update_car(car, app_state.car_input);
 
 		//
 		// Rendering:
